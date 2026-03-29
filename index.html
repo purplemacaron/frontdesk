@@ -1,21 +1,50 @@
-// Next.js 14 익명 프론트데스크 (실서비스 강화 버전)
-// 추가: Redis rate limit, IP+쿠키 식별, 신고 개선
+// =========================
+// 📁 폴더 구조
+// =========================
+// app/
+//   page.js
+//   api/
+//     posts/route.js
+//     vote/route.js
+// lib/
+//   db.js
+//   ip.js
+//   rateLimit.js
 
 // =========================
-// 1. Redis (Upstash)
+// 📁 lib/db.js
 // =========================
-// npm install @upstash/redis
+import { Pool } from 'pg';
 
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL
+});
+
+// =========================
+// 📁 lib/ip.js
+// =========================
+import crypto from 'crypto';
+
+export function getIP(req) {
+  return req.headers.get('x-forwarded-for')?.split(',')[0] || '0.0.0.0';
+}
+
+export function hashIP(ip) {
+  return crypto.createHash('sha256')
+    .update(ip + process.env.IP_SALT)
+    .digest('hex');
+}
+
+// =========================
+// 📁 lib/rateLimit.js
+// =========================
 import { Redis } from '@upstash/redis';
 
-export const redis = new Redis({
+const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN
 });
 
-// =========================
-// 2. 고급 rate limit
-// =========================
 export async function rateLimit(key, limit = 10, window = 60) {
   const now = Date.now();
   const windowStart = now - window * 1000;
@@ -23,173 +52,126 @@ export async function rateLimit(key, limit = 10, window = 60) {
   await redis.zremrangebyscore(key, 0, windowStart);
   await redis.zadd(key, { score: now, member: now.toString() });
   const count = await redis.zcard(key);
-
   await redis.expire(key, window);
 
   return count <= limit;
 }
 
-// 사용
-// const key = `rate:${ipHash}:${cookieId}`
-// if (!(await rateLimit(key))) return Response.json({ error: 'rate limit' });
-
 // =========================
-// 3. 쿠키 기반 식별
+// 📁 app/api/posts/route.js
 // =========================
-import { cookies } from 'next/headers';
-import crypto from 'crypto';
+import { pool } from '@/lib/db';
+import bcrypt from 'bcrypt';
+import { getIP, hashIP } from '@/lib/ip';
+import { rateLimit } from '@/lib/rateLimit';
 
-export function getClientId() {
-  const c = cookies();
-  let id = c.get('cid')?.value;
-
-  if (!id) {
-    id = crypto.randomUUID();
-    c.set('cid', id);
-  }
-
-  return id;
-}
-
-// =========================
-// 4. IP + 쿠키 조합
-// =========================
-// key 생성
-// const key = `user:${ipHash}:${clientId}`
-
-// =========================
-// 5. 신고 개선 (비율 기반)
-// =========================
-export async function report(postId, ipHash) {
-  await pool.query(
-    'INSERT INTO reports (post_id, ip_hash) VALUES ($1,$2) ON CONFLICT DO NOTHING',
-    [postId, ipHash]
-  );
-
-  const { rows: reportRows } = await pool.query(
-    'SELECT COUNT(*) FROM reports WHERE post_id=$1',
-    [postId]
-  );
-
-  const { rows: viewRows } = await pool.query(
-    'SELECT views FROM posts WHERE id=$1',
-    [postId]
-  );
-
-  const reports = parseInt(reportRows[0].count);
-  const views = viewRows[0].views || 1;
-
-  const ratio = reports / views;
-
-  // 10% 이상 신고 시 숨김
-  if (reports >= 5 && ratio > 0.1) {
-    await pool.query('UPDATE posts SET hidden=true WHERE id=$1', [postId]);
-  }
-
-  return { reports, ratio };
-}
-
-// =========================
-// 6. 조회수 추가
-// =========================
-export async function increaseView(id) {
-  await pool.query('UPDATE posts SET views = views + 1 WHERE id=$1', [id]);
-}
-
-// =========================
-// 7. DB 추가
-// =========================
-/*
-ALTER TABLE posts ADD COLUMN views INT DEFAULT 0;
-*/
-
-// =========================
-// 8. 관리자 신고 목록 API
-// =========================
-export async function GET(req) {
-  if (!isAdmin(req)) return Response.json({ error: 'forbidden' });
-
-  const { rows } = await pool.query(`
-    SELECT p.id, p.title, COUNT(r.id) as reports
-    FROM posts p
-    LEFT JOIN reports r ON p.id = r.post_id
-    GROUP BY p.id
-    ORDER BY reports DESC
-  `);
-
-  return Response.json(rows);
-}
-
-// =========================
-// 9. 인기글 알고리즘
-// =========================
-// 점수 = (votes * 2) + views - (시간 감쇠)
-
-export function hotScore(votes, views, createdAt) {
-  const hours = (Date.now() - new Date(createdAt)) / 3600000;
-  return votes * 2 + views - hours * 0.5;
-}
-
-// SQL에서 정렬 (간단 버전)
-// ORDER BY (votes * 2 + views) DESC
-
-// =========================
-// 10. 인기글 API
-// =========================
 export async function GET() {
   const { rows } = await pool.query(
-    `SELECT * FROM posts WHERE hidden=false ORDER BY (votes * 2 + views) DESC LIMIT 20`
+    'SELECT * FROM posts ORDER BY id DESC'
   );
-
   return Response.json(rows);
 }
 
+export async function POST(req) {
+  const ip = getIP(req);
+  const ipHash = hashIP(ip);
+
+  if (!(await rateLimit(`post:${ipHash}`))) {
+    return Response.json({ error: 'rate limit' });
+  }
+
+  const { title, content, password, nickname } = await req.json();
+
+  if (!title || !content || !password) {
+    return Response.json({ error: 'invalid' });
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+
+  await pool.query(
+    `INSERT INTO posts (title, content, password, nickname, votes, views, ip_hash)
+     VALUES ($1,$2,$3,$4,0,0,$5)`,
+    [title, content, hash, nickname || '익명', ipHash]
+  );
+
+  return Response.json({ ok: true });
+}
+
 // =========================
-// 11. 관리자 UI 페이지
+// 📁 app/api/vote/route.js
+// =========================
+import { pool } from '@/lib/db';
+
+export async function PATCH(req) {
+  const { id, value } = await req.json();
+
+  if (![1, -1].includes(value)) {
+    return Response.json({ error: 'invalid' });
+  }
+
+  await pool.query(
+    'UPDATE posts SET votes = votes + $1 WHERE id=$2',
+    [value, id]
+  );
+
+  return Response.json({ ok: true });
+}
+
+// =========================
+// 📁 app/page.js
 // =========================
 'use client';
 import { useEffect, useState } from 'react';
 
-export default function AdminPage() {
+export default function Page() {
   const [posts, setPosts] = useState([]);
-  const ADMIN_KEY = prompt('관리자 키');
 
   async function load() {
-    const res = await fetch('/api/admin/reports', {
-      headers: { 'x-admin-key': ADMIN_KEY }
-    });
+    const res = await fetch('/api/posts');
     setPosts(await res.json());
   }
 
-  async function remove(id) {
-    await fetch('/api/admin/delete', {
-      method: 'DELETE',
-      headers: { 'x-admin-key': ADMIN_KEY },
-      body: JSON.stringify({ id })
+  async function create() {
+    const title = prompt('제목');
+    const content = prompt('내용');
+    const nickname = prompt('닉네임');
+    const password = prompt('삭제 비밀번호');
+
+    if (!title || !content || !password) return;
+
+    await fetch('/api/posts', {
+      method: 'POST',
+      body: JSON.stringify({ title, content, password, nickname })
     });
+
     load();
   }
 
-  async function ban(ip) {
-    await fetch('/api/admin/ban', {
-      method: 'POST',
-      headers: { 'x-admin-key': ADMIN_KEY },
-      body: JSON.stringify({ ip })
+  async function vote(id, v) {
+    await fetch('/api/vote', {
+      method: 'PATCH',
+      body: JSON.stringify({ id, value: v })
     });
+
+    load();
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
   return (
-    <div style={{ background:'#111', color:'#fff', padding:20 }}>
-      <h1>관리자</h1>
+    <div style={{ background:'#1e1f22', color:'#fff', padding:20 }}>
+      <h1>프론트데스크</h1>
+      <button onClick={create}>글쓰기</button>
 
       {posts.map(p => (
         <div key={p.id} style={{ border:'1px solid #333', margin:10, padding:10 }}>
-          <b>{p.title}</b> (신고 {p.reports})
+          <b>{p.title}</b> [{p.nickname}] ({p.votes})
+          <p>{p.content}</p>
 
-          <button onClick={() => remove(p.id)}>삭제</button>
-          {/* IP는 필요 시 같이 내려줘야 함 */}
+          <button onClick={() => vote(p.id, 1)}>👍</button>
+          <button onClick={() => vote(p.id, -1)}>👎</button>
         </div>
       ))}
     </div>
@@ -197,146 +179,27 @@ export default function AdminPage() {
 }
 
 // =========================
-// 12. 비밀방 (게시글 비밀번호 보호)
+// 📁 SQL (DB에 실행)
 // =========================
-// posts 테이블 컬럼 추가
 /*
-ALTER TABLE posts ADD COLUMN is_private BOOLEAN DEFAULT false;
-ALTER TABLE posts ADD COLUMN view_password TEXT;
-ALTER TABLE posts ADD COLUMN nickname TEXT;
+CREATE TABLE posts (
+  id SERIAL PRIMARY KEY,
+  title TEXT,
+  content TEXT,
+  password TEXT,
+  nickname TEXT,
+  votes INT DEFAULT 0,
+  views INT DEFAULT 0,
+  ip_hash TEXT
+);
 */
 
-import bcrypt from 'bcrypt';
-
-// 글 작성 수정
-export async function POST(req) {
-  const { title, content, password, nickname, isPrivate, viewPassword } = await req.json();
-
-  const hash = await bcrypt.hash(password, 10);
-  const viewHash = isPrivate && viewPassword ? await bcrypt.hash(viewPassword, 10) : null;
-
-  await pool.query(
-    `INSERT INTO posts (title, content, password, votes, ip_hash, image, is_private, view_password, nickname)
-     VALUES ($1,$2,$3,0,$4,$5,$6,$7,$8)`,
-    [title, content, hash, 'tmp', null, isPrivate || false, viewHash, nickname || '익명']
-  );
-
-  return Response.json({ ok: true });
-}
-
 // =========================
-// 13. 비밀글 조회 API
+// 📁 .env
 // =========================
-export async function POST(req) {
-  const { id, password } = await req.json();
-
-  const { rows } = await pool.query('SELECT * FROM posts WHERE id=$1', [id]);
-  const post = rows[0];
-
-  if (!post) return Response.json({ error: 'not found' });
-
-  if (!post.is_private) return Response.json(post);
-
-  const ok = await bcrypt.compare(password, post.view_password);
-  if (!ok) return Response.json({ error: 'wrong password' });
-
-  return Response.json(post);
-}
-
-// =========================
-// 14. 프론트 (작성 시 닉네임 + 비밀 설정)
-// =========================
-async function create() {
-  const title = prompt('제목');
-  const content = prompt('내용');
-  const nickname = prompt('닉네임');
-  const password = prompt('삭제용 비밀번호');
-
-  const isPrivate = confirm('비밀글로 설정?');
-  let viewPassword = null;
-
-  if (isPrivate) {
-    viewPassword = prompt('열람 비밀번호');
-  }
-
-  await fetch('/api/posts', {
-    method: 'POST',
-    body: JSON.stringify({ title, content, password, nickname, isPrivate, viewPassword })
-  });
-
-  location.reload();
-}
-
-// =========================
-// 15. 프론트 (비밀글 접근)
-// =========================
-async function openPost(id, isPrivate) {
-  if (!isPrivate) {
-    location.href = `/post/${id}`;
-    return;
-  }
-
-  const pw = prompt('비밀번호 입력');
-
-  const res = await fetch('/api/posts/view', {
-    method: 'POST',
-    body: JSON.stringify({ id, password: pw })
-  });
-
-  const data = await res.json();
-
-  if (data.error) {
-    alert('비밀번호 틀림');
-  } else {
-    alert(data.content);
-  }
-}
-
-// =========================
-// 16. UI 표시 (디스코드 스타일)
-// =========================
-// 기본 다크 + 게임 커뮤니티 느낌
-
-const containerStyle = {
-  display: 'flex',
-  background: '#1e1f22',
-  color: '#dcddde',
-  height: '100vh'
-};
-
-const sidebarStyle = {
-  width: '220px',
-  background: '#2b2d31',
-  padding: '10px'
-};
-
-const mainStyle = {
-  flex: 1,
-  padding: '20px',
-  overflowY: 'auto'
-};
-
-// 레이아웃
-// <div style={containerStyle}>
-//   <div style={sidebarStyle}>채널 목록</div>
-//   <div style={mainStyle}>게시글</div>
-// </div>
-
-// 게시글 카드
-// <div style={{ background:'#313338', padding:10, marginBottom:10, borderRadius:8 }}>
-//   <b>{p.title}</b> [{p.nickname}] {p.is_private && '🔒'}
-// </div>
-
-// =========================
-// 핵심 요약
-// =========================
-// - 사이트 이름: 프론트데스크
-// - 디스코드 스타일 UI
-// - 게임 커뮤니티 구조
-// - 채널(게시판) 확장 가능
-
-// =========================
-// - 작성 시 닉네임 설정 가능
-// - 비밀글은 열람 비밀번호 필요
-// - 삭제용 비밀번호와 분리됨
-// - 프론트데스크 기능 완성 단계
+/*
+DATABASE_URL=postgres://...
+IP_SALT=anything_random
+UPSTASH_REDIS_REST_URL=...
+UPSTASH_REDIS_REST_TOKEN=...
+*/
